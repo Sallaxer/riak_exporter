@@ -1,22 +1,11 @@
-GO    := go
-PROMU := $(GOPATH)/bin/promu
-
-PREFIX  ?= $(shell pwd)
-BIN_DIR ?= $(shell pwd)
-
-all: build
-
+VERSION := 0.0.4
+FLAGS := CGO_ENABLED=0
 build:
-	@echo ">> building binaries"
-	@$(PROMU) build --prefix $(PREFIX)
+    @echo ">> building binaries" 
+	$(FLAGS) go build -mod=mod -ldflags "-s -w -X main.version=$(VERSION)" -o riak_exporter
 
-tarball: promu
-	@echo ">> building release tarball"
-	@$(PROMU) tarball --prefix $(PREFIX) $(BIN_DIR)
+run: build 
+	./riak_exporter
 
-promu:
-	@GOOS=$(shell uname -s | tr A-Z a-z) \
-		GOARCH=$(subst x86_64,amd64,$(patsubst i%86,386,$(shell uname -m))) \
-		$(GO) get -u github.com/prometheus/promu
-
-.PHONY: all build promu tarball
+clean: 
+	rm -f ./riak_exporter

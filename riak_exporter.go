@@ -2,202 +2,182 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/log"
-	"github.com/prometheus/common/version"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
 )
 
 var (
-	listenAddress = flag.String(
-		"web.listen-address", ":9104",
-		"Address to listen on for web interface and telemetry.",
-	)
-	metricsPath = flag.String(
-		"web.telemetry-path", "/metrics",
-		"Path under which to expose metrics.",
-	)
-	riakURI = flag.String(
-		"riak.uri", "http://localhost:8098",
-		"The URI which the Riak HTTP API listens on.",
-	)
+	listenAddress = flag.String("web.listen-address", ":9203", "Address to listen on for web interface and telemetry.")
+	riakURI       = flag.String("riak.uri", "http://localhost:8098", "The URI which the Riak HTTP API listens on.")
+	namespace     = "riak"
 )
-
-const (
-	namespace = "riak"
-	exporter  = "exporter"
-)
-
-var landingPage = []byte(`<html>
-<head><title>Riak exporter</title></head>
-<body>
-<h1>Riak exporter</h1>
-<p><a href='` + *metricsPath + `'>Metrics</a></p>
-</body>
-</html>
-`)
 
 type Exporter struct {
-	url             string
-	duration, error prometheus.Gauge
-	totalScrapes    prometheus.Counter
-	scrapeErrors    *prometheus.CounterVec
-	riakUp          prometheus.Gauge
+	uri          string
+	duration     prometheus.Gauge
+	totalScrapes prometheus.Counter
+	riakUp       prometheus.Gauge
+	scrapeError  prometheus.Gauge
 }
 
-func NewExporter(url string) *Exporter {
+func NewExporter(uri string) *Exporter {
 	return &Exporter{
-		url: url,
+		uri: uri,
 		duration: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
-			Subsystem: exporter,
 			Name:      "last_scrape_duration_seconds",
 			Help:      "Duration of the last scrape of metrics from Riak.",
 		}),
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
-			Subsystem: exporter,
 			Name:      "scrapes_total",
 			Help:      "Total number of times Riak was scraped for metrics.",
-		}),
-		// errorScrapes: prometheus.NewCounterVec(prometheus.CounterOpts{
-		// 	Namespace: namespace,
-		// 	Subsystem: exporter,
-		// 	Name:      "scrape_error_totals",
-		// 	Help:      "Total number of times an error occured scraping Riak",
-		// }, []string{"collector"}),
-		error: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Subsystem: exporter,
-			Name:      "last_scrape_error",
-			Help:      "Whether the last scrape of metrics from Riak resulted in an error (1 for error, 0 for success).",
 		}),
 		riakUp: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "up",
 			Help:      "Whether the Riak node is up.",
 		}),
+		scrapeError: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "last_scrape_error",
+			Help:      "Whether the last scrape of metrics from Riak resulted in an error (1 for error, 0 for success).",
+		}),
 	}
 }
+
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
-	metricCh := make(chan prometheus.Metric)
-	doneCh := make(chan struct{})
-
-	go func() {
-		for m := range metricCh {
-			ch <- m.Desc()
-		}
-
-		close(doneCh)
-	}()
-
-	e.Collect(metricCh)
-	close(metricCh)
-	<-doneCh
+	prometheus.DescribeByCollect(e, ch)
 }
 
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.scrape(ch)
-
 	ch <- e.duration
 	ch <- e.totalScrapes
-	ch <- e.error
 	ch <- e.riakUp
+	ch <- e.scrapeError
 }
 
 func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
-	e.totalScrapes.Inc()
-	var err error
+	startTime := time.Now()
+	defer func() {
+		e.duration.Set(time.Since(startTime).Seconds())
+	}()
 
-	defer func(begun time.Time) {
-		e.duration.Set(time.Since(begun).Seconds())
-		if err == nil {
-			e.error.Set(0)
-		} else {
-			e.error.Set(1)
-		}
-	}(time.Now())
-
-	pingResponse, err := http.Get(*riakURI + "/ping")
+	pingResponse, err := http.Get(e.uri + "/ping")
 	if err != nil {
-		log.Errorln("Error trying to ping the Riak node", *riakURI)
+		e.scrapeError.Set(1)
+		logrus.Error("Error trying to ping the Riak node: ", err)
 		return
 	}
+	defer pingResponse.Body.Close()
 
-	if pingResponse.StatusCode == 200 {
-		e.riakUp.Set(1)
-	} else {
-		e.riakUp.Set(0)
-		err = errors.New("Riak node is down")
-		log.Errorln("Riak node is down")
+	if pingResponse.StatusCode != http.StatusOK {
+		e.scrapeError.Set(1)
+		logrus.Error("Riak node is down")
 		return
 	}
+	e.riakUp.Set(1)
+	e.scrapeError.Set(0)
 
-	statsResponse, err := http.Get(*riakURI + "/stats")
+	statsResponse, err := http.Get(e.uri + "/stats")
 	if err != nil {
-		log.Errorln("Error trying to fetch the stats for the Riak node")
+		logrus.Errorln("Error trying to fetch the stats for the Riak node")
 		return
 	}
 
 	defer statsResponse.Body.Close()
 
-	if statsResponse.StatusCode != 200 {
-		err = errors.New("Error when fetching the stats for the Riak node")
-		log.Errorln("Error when fetching the stats for the Riak node")
+	if statsResponse.StatusCode != http.StatusOK {
+		e.scrapeError.Set(1)
+		logrus.Errorln("Error when fetching the stats for the Riak node")
 		return
 	}
 
-	data, err := ioutil.ReadAll(statsResponse.Body)
+	data, err := io.ReadAll(statsResponse.Body)
 	if err != nil {
-		log.Errorln("Error reading the response body for the /stats endpoint")
+		e.scrapeError.Set(1)
+		logrus.Errorln("Error reading the response body for the /stats endpoint")
 		return
 	}
 
-	var f interface{}
-	err = json.Unmarshal(data, &f)
-
-	if err != nil {
-		log.Errorln("Error parsing the Riak metrics")
+	var f map[string]interface{}
+	if err = json.Unmarshal(data, &f); err != nil {
+		e.scrapeError.Set(1)
+		logrus.Errorln("Error parsing the Riak metrics")
 		return
 	}
 
-	m := f.(map[string]interface{})
+	stringMetrics := map[string]string{
+		"storage_backend":       "Configuration storage backend of Riak",
+		"sys_driver_version":    "Driver version of Riak system",
+		"sys_global_heaps_size": "Global heaps size of Riak system",
+		"sys_heap_type":         "Heap type of Riak system",
+		"sys_otp_release":       "OTP release of Riak system",
+		"sys_system_version":    "System version of Riak",
+	}
 
-	for metricName, metricValue := range m {
-		description := prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "", metricName),
-			metricName,
-			nil,
-			nil,
-		)
+	for metricName, metricDesc := range stringMetrics {
+		if value, ok := f[metricName].(string); ok {
+			desc := prometheus.NewDesc(
+				prometheus.BuildFQName(namespace, "", metricName),
+				metricDesc,
+				[]string{"value"},
+				nil,
+			)
+			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, 1, value)
+			logrus.Infof("Creating metric %s with value %s", metricName, value)
+		}
+	}
 
+	processNodeRelatedMetrics(f, ch)
+
+	for metricName, metricValue := range f {
 		if value, ok := metricValue.(float64); ok {
-			ch <- prometheus.MustNewConstMetric(description, prometheus.GaugeValue, value)
+			desc := prometheus.NewDesc(
+				prometheus.BuildFQName(namespace, "", metricName),
+				metricName,
+				nil,
+				nil,
+			)
+			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value)
 		}
 	}
 }
 
-func init() {
-	prometheus.MustRegister(version.NewCollector("riak_exporter"))
+func processNodeRelatedMetrics(f map[string]interface{}, ch chan<- prometheus.Metric) {
+	nodeMetrics := []string{"connected_nodes", "ring_members"}
+	for _, metricName := range nodeMetrics {
+		if nodes, ok := f[metricName].([]interface{}); ok {
+			totalDesc := prometheus.NewDesc(prometheus.BuildFQName(namespace, "", metricName+"_total"), "Total count of "+metricName, nil, nil)
+			ch <- prometheus.MustNewConstMetric(totalDesc, prometheus.GaugeValue, float64(len(nodes)))
+
+			for _, node := range nodes {
+				if nodeName, ok := node.(string); ok {
+					desc := prometheus.NewDesc(prometheus.BuildFQName(namespace, "", metricName), metricName, []string{"node"}, nil)
+					ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, 1, nodeName)
+				}
+			}
+		}
+	}
 }
 
 func main() {
+	logrus.SetLevel(logrus.InfoLevel)
 	flag.Parse()
 
-	exporter := NewExporter(*riakURI + "/stats")
-	prometheus.MustRegister(exporter)
+	registry := prometheus.NewRegistry()
+	exporter := NewExporter(*riakURI)
+	registry.MustRegister(exporter)
 
-	http.Handle(*metricsPath, prometheus.Handler())
+	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write(landingPage)
-	})
-
-	log.Infoln("Listening on", *listenAddress)
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	logrus.Infof("Listening on %s", *listenAddress)
+	logrus.Fatal(http.ListenAndServe(*listenAddress, nil))
 }
