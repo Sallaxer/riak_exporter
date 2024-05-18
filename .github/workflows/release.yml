@@ -20,13 +20,9 @@ jobs:
         with:
             go-version-file: go.mod
 
-      - name: Install GoReleaser
+      - name: Install and run GoReleaser
         run: |
           curl -sL https://git.io/goreleaser | bash
-        env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and release
+          goreleaser --rm-dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: goreleaser --rm-dist
