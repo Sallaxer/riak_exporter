@@ -13,16 +13,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-            fetch-depth: 0
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-            go-version-file: go.mod
+          go-version-file: go.mod
 
-      - name: Install and run GoReleaser
+      - name: Add GoReleaser APT repository
         run: |
-          curl -sL https://git.io/goreleaser | bash
-          goreleaser --rm-dist
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt update
+
+      - name: Install GoReleaser
+        run: sudo apt install -y goreleaser
+
+      - name: Build and release
+        run: goreleaser --rm-dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
