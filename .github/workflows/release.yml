@@ -29,6 +29,6 @@ jobs:
         run: sudo apt install -y goreleaser
 
       - name: Build and release
-        run: goreleaser --rm-dist
+        run: goreleaser --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
